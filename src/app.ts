@@ -1,0 +1,236 @@
+import express from "express";
+import https from "https";
+import fs from "node:fs";
+import path from "path";
+import cookieparser from "cookie-parser";
+import stream from "stream";
+import koffi from "koffi";
+import cluster from "node:cluster";
+
+import allmisc from "./miscellaneous/allmisc";
+import {Request, Response, NextFunction} from 'express';
+import Stats from "./middlewares/stats/allStats";
+import TargetServerStatus from "./middlewares/stats/targetServerStatus";
+import ComputerUsage from "./middlewares/stats/computingPowerUsage";
+import initialize from "./config/initialize";
+import { settingsData } from "./config/initialize";
+import ServerStatusModule from './middlewares/serverStatusMoniterManager/serverStatus'
+import ServiceStatusManager from "./middlewares/serverStatusMoniterManager/serverStatusManager";
+import LogOnStart from "./controllers/logs/logOnStart";
+import NeutralizeIP from "./middlewares/IpModule/ipNeutralization";
+import OriginFiltering from "./middlewares/IpModule/ipBasedFiltering";
+import { sslOptions } from "./interfaces/interfaces";
+import DNSmodule from "./controllers/dnslookup/dnslookup";
+import XForwarderFor from "./middlewares/XForwardedFor/XForwardedFor";
+
+//middlewares
+import RequestRateModule from "./middlewares/stats/requestRateCounter";
+import CookieHandlers from "./middlewares/cookieEncryption/cookieEncrypt";
+import RateLimiter from "./middlewares/ratelimiting/ratelimiting";
+import AdminIdentifier from "./middlewares/adminMiddleware/identifyAdmin";
+import ProcessXAdminHeader from "./middlewares/adminMiddleware/processX-AdminHeader";
+
+//config settings
+initialize.initializeSettings(0, spawnWorkers);
+
+//Spawn Workers
+function spawnWorkers(){
+  if(Number.isNaN(parseInt(settingsData.workers)) == true){
+    if(cluster.isPrimary){
+      for(let i = 0; i < settingsData.cpuLength; i++){
+        cluster.fork()
+      }
+    }else{
+      mainFunction()
+    }
+  }else{
+    if(cluster.isPrimary){
+      for(let i = 0; i < parseInt(settingsData.workers); i++){
+        cluster.fork()
+      }
+    }else{
+      mainFunction()
+    }
+  }
+}
+
+//main function of the module; runs only when everythings alright, configs are loaded and other checklists are completed
+async function mainFunction() {
+  //mainfunction start
+
+  const app = express();
+  app.use(cookieparser());
+
+  let sslOptions: sslOptions = {
+    key: Buffer.alloc(1),
+    cert: Buffer.alloc(1),
+  };
+
+  if (settingsData.protocol == "https") {
+    try {
+      sslOptions = {
+        key: fs.readFileSync(settingsData.sslKeyPath),
+        cert: fs.readFileSync(settingsData.sslCertPath),
+      };
+      startOnHTTPS();
+    } catch (e) {
+      console.log(
+        "FATAL! SSL key or certificate could not be found, therefore running on http",
+      );
+      startOnHTTP();
+    }
+  } else {
+    startOnHTTP();
+  }
+
+  app.set("view engine", "ejs");
+  app.set("views", path.resolve(process.cwd(), "../views"));
+
+  const controller = new AbortController();
+
+  //====layer 1 : Handle Admin Instructions
+  app.use(
+    AdminIdentifier.identifyAdmin(
+      settingsData.adminMode,
+      settingsData.adminDefinedPath,
+      settingsData.adminRequiredReloadCount,
+      settingsData.adminReloadTimeWindow,
+    ),
+  );
+  // app.use(
+  //   ProcessXAdminHeader.processXAdminHeader(
+  //     settingsData.adminDefinedPath,
+  //     "34f3r",
+  //   ),
+  // );
+
+  //====layer 2 : Reject requests if NetBreaker is offline (runningStatus=0)
+  app.use(ServiceStatusManager.handleServiceStatus());
+
+  //====layer 3 : Ip Normalization & Origin Inspecter
+  app.use(NeutralizeIP.neutralizeIPv4AndIPv6); //Adds req.normalIP, IP address regardless of IPv4 or IPv6
+  app.use(OriginFiltering.filterOrigin(settingsData.inspectOriginMode));
+
+  //====layer 4 : rate-limiting
+  app.use(RateLimiter.limitRateTo(settingsData.maxRequestRateLimit));
+
+  //====layer 5 : memory limiting/load queuer
+
+  //====layer 6: catches if the server is offline
+  app.use(ServerStatusModule.checkTargetServerStatus())
+  // app.use(ServiceStatusManager.handleTargetServiceStatus())
+
+  //====layer 7 : remove unnecessary headers
+  app.disable("x-powered-by");
+
+  //====layer 8 : add necessary headers
+  app.use(XForwarderFor.addXForwardedFor())
+
+  //====layer 8 : Stats
+  app.use(RequestRateModule.requestRateCounter);
+  RequestRateModule.refreshCounterAndUpdateRate(); //to initiate the request counter
+
+  //Log Stats
+  Stats.LogStats(1000); //for development phase and testing
+
+  // memory-usage-updater
+  ComputerUsage.memoryUsageMonitor();
+
+  //====layer 9 : cookiehandlers
+  app.use(
+    CookieHandlers.handleIncomingCookie(
+      settingsData.cipherkey,
+      settingsData.cookieEncryption,
+    ),
+  );
+
+  //final response when every security layer is passed
+  app.use(async (req: Request , res: Response, next: NextFunction) => {
+    if (!DNSmodule.checkDomainInventory(req.hostname)) {
+      res.render("renderError", {
+        errno: -105,
+        msg: "Failed to lookup for hostname - " + req.hostname,
+        errhash : "https://netbreaker.maywill.online/docs"
+      });
+    }
+    await fetch(
+      "http://127.0.0.1:" + DNSmodule.smartDnsLookup(req.hostname, req.normalIP ?? "") + req.path,
+      {
+        method: req.method.toString(),
+        headers: req.headers as HeadersInit,
+        body: req.method === "GET" || req.method === "HEAD"
+          ? undefined
+          : req as any,
+        duplex: "half",
+        signal: controller.signal,
+      } as any,
+    )
+    .then((response: any) => {
+        response.headers.forEach((value: string, key: string) => {
+          const lowerkey = key.toLowerCase();
+          const headerblocklist = [
+            "content-encoding",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "x-powered-by",
+          ];
+          if (!headerblocklist.includes(lowerkey)) {
+            res.setHeader(key, value);
+          }
+        });
+        res.setHeader(
+          "Set-Cookie",
+          CookieHandlers.handleOutGoingCookie(
+            response,
+            settingsData.cipherkey,
+            settingsData.cookieEncryption,
+          ),
+        );
+        res.status(response.status);
+        if (!response.body) {
+          return res.end();
+        }
+        const mainStream = stream.Readable.fromWeb(response.body as any);
+        mainStream.on("error", (err) => {
+          if (!res.headersSent) {
+            res.status(500).end()
+          } else {
+            res.destroy(err)
+          }
+        })
+        mainStream.pipe(res)
+        return
+      })
+      .catch((err) => {
+        settingsData.currentServerStatus = 0;
+      });
+  });
+
+  function startOnHTTP() {
+    app.listen(settingsData.port, () => {
+      LogOnStart.logOnStart();
+    });
+  }
+  function startOnHTTPS() {
+    const secureServer = https.createServer(sslOptions, app);
+    secureServer.listen(settingsData.port, () => {
+      LogOnStart.logOnStart();
+      console.log("Listening on https");
+    });
+  }
+
+  //mainfunction end
+}
+
+//to add :
+// load queuer (based on memory usage)
+// load balancer
+// admin panel
+//add a packet inspector
+//fix rate limiter
+//for authentication of admin, he/she will send a request access, and NB will send a random hash key, for every request, and then the admin will send the credentials in that hashed form, and NB will authorize it. one hash key for every request, and different for every IP address
+
+//when an ip is added to whitelist by admin panel, update the ipwhitelist.nb file at that moment only
+//add a lightweight standbymode when NetBreaker is off, ie status=0 or currentServerStatus=0, which responds as res.end()

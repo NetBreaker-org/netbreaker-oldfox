@@ -1,0 +1,46 @@
+{
+  "name": "netbreaker",
+  "version": "1.0.0",
+  "description": "A program for securing your device while forwarding a port on your local network to WAN",
+  "keywords": [
+    "network",
+    "security",
+    "cybersecurity",
+    "networking",
+    "wifi",
+    "wan",
+    "lan",
+    "portforwarding",
+    "safety"
+  ],
+  "homepage": "https://netbreaker.maywill.online",
+  "bugs": {
+    "url": "https://github.com/kaushal937/NetBreaker/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaushal937/NetBreaker.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Kaushal (https://github.com/kaushal937)",
+  "main": "app.ts",
+  "scripts": {
+    "start": "npx tsc && node dist/app.js"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/ejs": "^3.1.5",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.7.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "cookie": "^1.1.1",
+    "cookie-parser": "^1.4.7",
+    "ejs": "^6.0.1",
+    "express": "^5.2.1",
+    "helmet": "^8.2.0",
+    "koffi": "^3.3.3",
+    "set-cookie-parser": "^3.1.1"
+  }
+}
